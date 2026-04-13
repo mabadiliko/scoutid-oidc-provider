@@ -1,7 +1,0 @@
-uvicorn[standard]
-fastapi
-itsdangerous
-python-multipart
-httpx
-joserfc
-jinja2

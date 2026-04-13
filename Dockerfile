@@ -1,13 +1,17 @@
 FROM python:3.12-slim
 
-WORKDIR /usr/src/app
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
 ENV TZ="Europe/Stockholm"
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-RUN pip install -U pip wheel setuptools
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+ENV PATH="/app/.venv/bin:$PATH"
 
-COPY . .
+COPY main.py static/ templates/ ./
 
 CMD [ "python", "./main.py" ]
