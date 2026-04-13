@@ -8,10 +8,14 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 COPY pyproject.toml uv.lock ./
+# Install only runtime dependencies for this production container image.
 RUN uv sync --frozen --no-dev
 
 ENV PATH="/app/.venv/bin:$PATH"
 
-COPY main.py static/ templates/ ./
+# Expect `main.py`, `static/`, and `templates/` to exist in the build context.
+COPY main.py ./
+COPY static/ ./static/
+COPY templates/ ./templates/
 
 CMD [ "python", "./main.py" ]
