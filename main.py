@@ -4,6 +4,7 @@ import logging
 import os
 import secrets
 import time
+from contextlib import asynccontextmanager
 from typing import Any, TypedDict
 from urllib.parse import urlparse
 
@@ -14,7 +15,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from joserfc import jwt
-from joserfc.jwk import OctKey
+from joserfc.jwk import KeySet, RSAKey
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -44,6 +45,16 @@ IDP_CLIENT_SECRET = get_required_env("IDP_CLIENT_SECRET")  # Client secret for t
 IDP_REDIRECT_URI = get_required_env("IDP_REDIRECT_URI")  # Redirect URI for the OIDC provider
 IDP_POST_LOGOUT_REDIRECT_URI = os.getenv("IDP_POST_LOGOUT_REDIRECT_URI")  # Allowed post-logout redirect URI
 
+# Path where the RSA private key is stored (PEM). If the file does not exist at startup
+# a new 2048-bit key pair is generated and written there. Mount a Kubernetes Secret at
+# this path to persist the key across pod restarts.
+IDP_PRIVATE_KEY_PATH = os.getenv("IDP_PRIVATE_KEY_PATH", "/data/private_key.pem")
+
+# How preferred_username is formatted in tokens.
+#   "at"   → "<scoutnet-username>@scoutnet.se"   (default, compatible with MediaWiki)
+#   "pipe" → "scoutnet|<member_no>"              (compatible with ms-utrustning)
+IDP_PREFERRED_USERNAME_FORMAT = os.getenv("IDP_PREFERRED_USERNAME_FORMAT", "at")
+
 FORGOT_PASSWORD_URL = os.getenv("FORGOT_PASSWORD_URL", "https://www.scoutnet.se/request_password")  # Forgot password link shown on login page (set empty to hide)
 
 SCOUTNET_API = os.getenv("SCOUTNET_API", "https://scoutnet.se/api")  # Base URL for the Scoutnet API
@@ -54,6 +65,9 @@ SCOUTNET_APP_DEVICE_NAME = os.getenv("SCOUTNET_APP_DEVICE_NAME", "My ScoutID")  
 DEBUG_MODE = os.getenv("DEBUG", "false") == "true"  # Global DEBUG logging
 LOGFORMAT = "%(asctime)s %(funcName)-10s [%(levelname)s] %(message)s"  # Log format
 HTTP_SERVER_PORT = int(os.getenv("HTTP_SERVER_PORT", "5000"))
+
+logging.basicConfig(level=logging.DEBUG if DEBUG_MODE else logging.INFO, format=LOGFORMAT)
+logging.getLogger("multipart").setLevel(logging.WARNING)  # Suppress noisy python-multipart parser
 
 
 """
@@ -120,9 +134,35 @@ def is_allowed_post_logout_redirect(target_url: str, allowed_base_url: str | Non
 
 
 """
-JWT setup
+JWT setup — RS256 with a persisted RSA key pair.
+
+On startup the key is loaded from IDP_PRIVATE_KEY_PATH. If the file does not exist
+a new 2048-bit RSA key pair is generated and written there so that it survives pod
+restarts (mount a Kubernetes Secret or PVC at that path). The public key is exposed
+via the JWKS endpoint so that relying parties can verify tokens independently.
 """
-jwt_key = OctKey.import_key(IDP_CLIENT_SECRET.encode())  # HS256: client secret = signing key
+
+
+def _load_or_generate_rsa_key(path: str) -> RSAKey:
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            pem = f.read()
+        key = RSAKey.import_key(pem)
+        logging.info("Loaded RSA key from %s", path)
+        return key
+
+    logging.info("No RSA key found at %s — generating a new 2048-bit key pair", path)
+    key = RSAKey.generate_key(2048, {"use": "sig"})
+    pem = key.as_pem(private=True)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(pem)
+    logging.info("Saved new RSA private key to %s", path)
+    return key
+
+
+jwt_key: RSAKey = _load_or_generate_rsa_key(IDP_PRIVATE_KEY_PATH)
+jwt_keyset = KeySet([jwt_key])
 
 
 """
@@ -134,7 +174,20 @@ templates = Jinja2Templates(directory="templates")
 """
 FastAPI setup and middleware
 """
-app = FastAPI()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logging.info(
+        "scoutid-oidc-provider starting on port %d (issuer=%s, debug=%s)",
+        HTTP_SERVER_PORT,
+        IDP_ISSUER,
+        DEBUG_MODE,
+    )
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET_KEY,
@@ -239,8 +292,10 @@ async def authorize(
     client_id: str,
     redirect_uri: str,
     scope: str,
-    state: str | None,
-    nonce: str | None,
+    state: str | None = None,
+    nonce: str | None = None,
+    code_challenge: str | None = None,       # PKCE — accepted but not verified
+    code_challenge_method: str | None = None, # PKCE — accepted but not verified
 ):
     """
     Called from the client, either direct or through a redirect from the client
@@ -268,9 +323,6 @@ async def authorize(
     if "openid" not in scope:
         logging.error("Missing 'openid' in scope")
         raise HTTPException(status_code=400, detail="Missing 'openid' in scope")
-    if state is None:
-        logging.error("Missing state parameter")
-        raise HTTPException(status_code=400, detail="Missing state parameter")
     if redirect_uri != IDP_REDIRECT_URI:
         logging.error(f"Invalid redirect URI: {redirect_uri}")
         raise HTTPException(status_code=400, detail="Invalid redirect URI")
@@ -303,7 +355,9 @@ async def authorize(
     active_requests[code]["userinfo"] = userinfo  # Save userinfo for expected token request from client
     logging.info("Active session found, redirecting back to client")
 
-    redirect_response = f"{redirect_uri}?state={state}&session_state={session_state}&code={code}"
+    redirect_response = f"{redirect_uri}?session_state={session_state}&code={code}"
+    if state is not None:
+        redirect_response += f"&state={state}"
     return RedirectResponse(redirect_response)  # Return to client
 
 
@@ -395,12 +449,17 @@ async def login_token(
         role_list = [f"{a}:{c}:member" for a, b in profile["memberships"].items() if b for c in b]
         role_list.extend([f"{a}:{c}:{e}" for a, b in user_roles.items() if b for c, d in b.items() for e in d.values()])
 
+        if IDP_PREFERRED_USERNAME_FORMAT == "pipe":
+            preferred_username = f"scoutnet|{profile['member_no']}"
+        else:  # "at" (default)
+            preferred_username = f"{profile['username']}@scoutnet.se"
+
         userinfo: UserInfo = {
             "sub": profile["member_no"],
             "name": profile["first_name"] + " " + profile["last_name"],
             "given_name": profile["first_name"],
             "family_name": profile["last_name"],
-            "preferred_username": profile["username"] + "@scoutnet.se",
+            "preferred_username": preferred_username,
             "email": profile["email"],
             "email_verified": True,
             "locale": profile["language"],
@@ -419,7 +478,9 @@ async def login_token(
     redirect_uri = active_requests[code]["redirect_uri"]
     state = active_requests[code]["state"]
     session_state = active_requests[code]["session_state"]
-    redirect_response = f"{redirect_uri}?state={state}&session_state={session_state}&code={code}"
+    redirect_response = f"{redirect_uri}?session_state={session_state}&code={code}"
+    if state is not None:
+        redirect_response += f"&state={state}"
 
     return RedirectResponse(url=redirect_response, status_code=303)  # Use 303 See Other to force a GET
 
@@ -440,7 +501,7 @@ def logout(request: Request, id_token_hint: str, post_logout_redirect_uri: str, 
         raise HTTPException(status_code=400, detail="Invalid post_logout_redirect_uri")
 
     try:
-        token = jwt.decode(id_token_hint, jwt_key)
+        token = jwt.decode(id_token_hint, jwt_keyset)
         userinfo = token.claims
     except Exception:
         logging.error("Invalid id_token_hint signature")
@@ -527,43 +588,44 @@ async def issue_token(
     nonce = request_details["nonce"]
     timestamp = request_details["timestamp"]
 
-    access_token = secrets.token_urlsafe(32)
+    now = int(time.time())
+    exp = now + JWT_EXP_DELTA_SECONDS
 
-    id_token_payload: dict[str, Any] = {
-        "iss": IDP_ISSUER,  # Should be a URL, e.g., "https://your-idp.example.com"
+    base_payload: dict[str, Any] = {
+        "iss": IDP_ISSUER,
         "sub": request_userinfo["sub"],
         "aud": client_id,
-        "exp": int(time.time()) + JWT_EXP_DELTA_SECONDS,
-        "iat": int(time.time()),
+        "exp": exp,
+        "iat": now,
         "auth_time": timestamp,
         "azp": client_id,
         "sid": session_state,
     }
-    # Add nonce if present
-    if nonce:
-        id_token_payload["nonce"] = nonce
     # Add standard OIDC claims if available
     for claim in ["name", "email", "email_verified", "preferred_username", "given_name", "family_name", "locale"]:
         if claim in request_userinfo:
-            id_token_payload[claim] = request_userinfo[claim]
+            base_payload[claim] = request_userinfo[claim]
     # Add roles if present
     if "roles" in request_userinfo:
-        id_token_payload["roles"] = request_userinfo["roles"]
+        base_payload["roles"] = request_userinfo["roles"]
 
-    id_token = jwt.encode(
-        {"alg": "HS256", "typ": "JWT"},
-        id_token_payload,
-        jwt_key,
-    )
+    # ID token — includes nonce if provided
+    id_token_payload = dict(base_payload)
+    if nonce:
+        id_token_payload["nonce"] = nonce
+    id_token = jwt.encode({"alg": "RS256", "typ": "JWT"}, id_token_payload, jwt_key)
 
-    exp = int(time.time()) + JWT_EXP_DELTA_SECONDS
-    access_tokens[access_token] = {
+    # Access token — JWT without nonce, used by the resource server (Go API) to verify identity
+    access_token_jwt = jwt.encode({"alg": "RS256", "typ": "at+JWT"}, base_payload, jwt_key)
+
+    # Keep in-memory map for userinfo endpoint lookup (keyed by sub for efficient lookup)
+    access_tokens[access_token_jwt] = {
         "userinfo": request_userinfo,
         "exp": exp,
     }
 
-    token = {
-        "access_token": access_token,
+    return {
+        "access_token": access_token_jwt,
         "expires_in": JWT_EXP_DELTA_SECONDS,
         "token_type": "Bearer",
         "id_token": id_token,
@@ -573,27 +635,27 @@ async def issue_token(
         "expires_at": exp,
     }
 
-    return token
-
 
 @app.get("/api/userinfo", include_in_schema=False)
 async def userinfo(authorization: str | None = Header(None)):
     """
     Returns claims for the authenticated user identified by the Bearer access token.
     Called server-side by the OIDC client (e.g. jumbojett) after token exchange.
+    The access token is a signed JWT; we look it up in the in-memory map by its raw
+    string value so we avoid redundant crypto on every userinfo call.
     """
     logging.info("Userinfo request received")
     if not authorization or not authorization.startswith("Bearer "):
         logging.error("Missing or invalid Authorization header for userinfo")
         raise HTTPException(status_code=401, detail="invalid_token")
 
-    token = authorization.split(" ", 1)[1]
-    token_data = access_tokens.get(token)
+    raw_token = authorization.split(" ", 1)[1]
+    token_data = access_tokens.get(raw_token)
     if not token_data:
         logging.error("Unknown or expired access token for userinfo")
         raise HTTPException(status_code=401, detail="invalid_token")
     if int(time.time()) > token_data["exp"]:
-        del access_tokens[token]
+        del access_tokens[raw_token]
         logging.error("Expired access token for userinfo")
         raise HTTPException(status_code=401, detail="invalid_token")
 
@@ -614,10 +676,11 @@ async def openid_configuration():
         "authorization_endpoint": f"{IDP_ISSUER}/auth/authorize",  # browser-facing (via ingress)
         "token_endpoint": f"{IDP_INTERNAL_URL}/api/token",  # server-to-server (cluster-internal)
         "userinfo_endpoint": f"{IDP_INTERNAL_URL}/api/userinfo",  # server-to-server (cluster-internal)
+        "jwks_uri": f"{IDP_ISSUER}/.well-known/jwks.json",
         "end_session_endpoint": f"{IDP_ISSUER}/auth/logout",  # browser-facing (via ingress)
         "response_types_supported": ["code"],
         "subject_types_supported": ["public"],
-        "id_token_signing_alg_values_supported": ["HS256"],
+        "id_token_signing_alg_values_supported": ["RS256"],
         "scopes_supported": ["openid", "profile", "email"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic"],
         "claims_supported": [
@@ -636,15 +699,12 @@ async def openid_configuration():
 
 @app.get("/.well-known/jwks.json", include_in_schema=False)
 async def jwks():
-    return {"keys": []}
+    """Expose the RSA public key so relying parties can verify RS256 token signatures."""
+    return jwt_keyset.as_dict(private=False)
 
 
 """
 Main function (entry point)
 """
 if __name__ == "__main__":
-    # Enable logging. INFO is default. DEBUG if requested
-    logging.basicConfig(level=logging.DEBUG if DEBUG_MODE else logging.INFO, format=LOGFORMAT)
-    logging.getLogger("multipart").setLevel(logging.WARNING) # Supress noisy python-multipart parser
-
     uvicorn.run("main:app", host="0.0.0.0", port=HTTP_SERVER_PORT, log_config=None)
